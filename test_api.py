@@ -3,14 +3,18 @@ import requests
 import json
 import time
 
-# If you’re using python-dotenv, uncomment these two lines:
-# from dotenv import load_dotenv
-# load_dotenv()
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
 
 # Retrieve token from environment
 TEAM_TOKEN = os.getenv("HACKRX_TEAM_TOKEN")
 if not TEAM_TOKEN:
-    raise RuntimeError("HACKRX_TEAM_TOKEN is not set in the environment")
+    print("❌ HACKRX_TEAM_TOKEN not found in environment variables")
+    print("📝 Make sure your .env file contains:")
+    print("   HACKRX_TEAM_TOKEN=your_token_here")
+    print("   GEMINI_API_KEY=your_gemini_key_here")
+    raise RuntimeError("TEAM_TOKEN is not set in the environment")
 
 def test_health():
     """Test the health endpoint"""
@@ -111,6 +115,7 @@ def test_all_questions():
 
 def main():
     print("🚀 Starting API Tests...")
+    print(f"🔑 Using token: {TEAM_TOKEN[:20]}...")  # Show first 20 chars for verification
 
     # Test health endpoint
     if not test_health():
