@@ -1,9 +1,4 @@
 services:
   - type: web
-    name: hackrx-budgetbandits
+    name: hackrx-api-service
     env: docker
-    envVars:
-      - key: GEMINI_API_KEY
-        fromSecret: true
-      - key: HACKRX_TEAM_TOKEN
-        fromSecret: true
