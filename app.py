@@ -56,20 +56,14 @@ GENERATION_CONFIG = genai.types.GenerationConfig(
 )
 
 # --- MEMORY OPTIMIZATION: Lazy Loading for Embedding Model ---
-# We define a placeholder for the model and a function to load it on first use.
-# This prevents loading the large model into memory when the app starts.
 EMBEDDING_MODEL = None
 EMBEDDING_DIM = 384
 
 def get_embedding_model():
-    """
-    Lazily loads and caches the SentenceTransformer model to save memory on startup.
-    """
+    """Lazily loads the SentenceTransformer model to save memory on startup."""
     global EMBEDDING_MODEL
     if EMBEDDING_MODEL is None:
         print("🧠 Lazily loading embedding model (this will happen only once)...")
-        # UPDATED: Switched to a faster model to avoid request timeouts on free tiers.
-        # This model is excellent for question-answering tasks.
         EMBEDDING_MODEL = SentenceTransformer('multi-qa-MiniLM-L6-cos-v1')
         print("✅ Embedding model loaded into memory.")
     return EMBEDDING_MODEL
@@ -82,7 +76,7 @@ DOCUMENT_STORE = []
 app = FastAPI(
     title="High-Accuracy HackRx LLM Query Retrieval System",
     description="A generalized RAG system optimized for low-memory deployment.",
-    version="3.2.0" # Version bump for the model change
+    version="3.3.0" # Version bump for batch processing fix
 )
 security = HTTPBearer()
 
@@ -180,20 +174,31 @@ class SemanticSearchService:
         self.faiss_index = FAISS_INDEX
         self.document_store = DOCUMENT_STORE
     
-    def embed_and_index(self, chunks: List[DocumentChunk]) -> None:
+    def embed_and_index(self, chunks: List[DocumentChunk], batch_size: int = 32) -> None:
+        """
+        Embeds chunks in batches to prevent memory overload on the server.
+        """
         if not chunks: return
         self.faiss_index.reset(); self.document_store.clear()
-        model = get_embedding_model() # Load model on demand
-        texts = [chunk.content for chunk in chunks]
-        print(f"🧠 Generating embeddings for {len(texts)} chunks...")
-        embeddings = model.encode(texts, normalize_embeddings=True)
-        self.faiss_index.add(embeddings.astype('float32'))
-        self.document_store.extend([{"content": c.content, "metadata": c.metadata} for c in chunks])
+        
+        model = get_embedding_model()
+        print(f"🧠 Generating embeddings for {len(chunks)} chunks in batches of {batch_size}...")
+        
+        # Process in batches
+        for i in range(0, len(chunks), batch_size):
+            batch_chunks = chunks[i:i + batch_size]
+            batch_texts = [chunk.content for chunk in batch_chunks]
+            
+            print(f"   - Processing batch {i//batch_size + 1}...")
+            embeddings = model.encode(batch_texts, normalize_embeddings=True)
+            self.faiss_index.add(embeddings.astype('float32'))
+            self.document_store.extend([{"content": c.content, "metadata": c.metadata} for c in batch_chunks])
+
         print(f"✅ Embedded and indexed {self.faiss_index.ntotal} chunks.")
     
     async def search(self, query: str, top_k: int = 8) -> List[ClauseMatch]:
         if self.faiss_index.ntotal == 0: return []
-        model = get_embedding_model() # Load model on demand
+        model = get_embedding_model()
         query_embedding = model.encode([query], normalize_embeddings=True)
         distances, indices = self.faiss_index.search(query_embedding.astype('float32'), min(top_k, self.faiss_index.ntotal))
         return [ClauseMatch(content=self.document_store[idx]["content"], similarity_score=float(dist)) for dist, idx in zip(distances[0], indices[0]) if idx != -1]
@@ -233,14 +238,21 @@ class LLMService:
                     print(f"Rate limit hit. Retrying in {wait_time:.2f}s...")
                     await asyncio.sleep(wait_time)
                 else:
+                    print(f"LLM Error for '{query[:30]}...': {e}")
                     return f"An error occurred while generating the answer."
         return "Failed to generate an answer after multiple retries."
     
     async def process_all_queries(self, queries: List[str], search_service: SemanticSearchService) -> List[str]:
-        async def _process_one(query: str):
+        """
+        Processes queries sequentially to ensure stability in low-memory environments.
+        """
+        answers = []
+        for query in queries:
+            print(f"🔍 Processing Q: '{query[:50]}...'")
             relevant_chunks = await search_service.search(query, top_k=8)
-            return await self.generate_answer(query, relevant_chunks)
-        return await asyncio.gather(*[_process_one(q) for q in queries])
+            answer = await self.generate_answer(query, relevant_chunks)
+            answers.append(answer)
+        return answers
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #                                 API ROUTES
@@ -263,7 +275,10 @@ async def run_submission(request: QueryRequest, _: str = Depends(verify_token)):
         file_type = doc_processor.get_file_type(request.documents)
         text = doc_processor.extract_text(content, file_type)
         chunks = doc_processor.sentence_aware_chunking(text, {"source": request.documents})
-        search_service.embed_and_index(chunks) # This will trigger the one-time model load
+        
+        # This is the memory-intensive step, now protected by batching.
+        search_service.embed_and_index(chunks)
+        
         answers = await llm_service.process_all_queries(request.questions, search_service)
         print(f"✅ Process completed in {time.time() - start_time:.2f}s.")
         return QueryResponse(answers=answers)
@@ -273,4 +288,4 @@ async def run_submission(request: QueryRequest, _: str = Depends(verify_token)):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "version": "3.2.0", "model": "gemini-1.5-flash"}
+    return {"status": "healthy", "version": "3.3.0", "model": "gemini-1.5-flash"}
