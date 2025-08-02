@@ -1,4 +1,0 @@
-services:
-  - type: web
-    name: hackrx-api-service
-    env: docker

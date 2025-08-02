@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Retrieve token from environment
-TEAM_TOKEN = os.getenv("HACKRX_TEAM_TOKEN")
+TEAM_TOKEN = os.getenv("HACKRX_API_KEY")
 if not TEAM_TOKEN:
     print("❌ HACKRX_TEAM_TOKEN not found in environment variables")
     print("📝 Make sure your .env file contains:")
