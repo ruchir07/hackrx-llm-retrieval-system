@@ -1,6 +1,6 @@
 """
-High-Accuracy HackRx LLM-Powered Query Retrieval System
-A robust, generalized RAG system designed for maximum accuracy.
+High-Accuracy HackRx LLM-Powered Query Retrieval System (Memory Optimized)
+A robust, generalized RAG system designed for maximum accuracy on low-memory environments.
 Run with: uvicorn app:app --host 0.0.0.0 --port 8000
 """
 
@@ -51,21 +51,38 @@ genai.configure(api_key=GEMINI_API_KEY)
 LLM_MODEL = genai.GenerativeModel('gemini-1.5-flash')
 GENERATION_CONFIG = genai.types.GenerationConfig(
     candidate_count=1,
-    max_output_tokens=300, # Increased slightly for more comprehensive single sentences
-    temperature=0.0,      # Set to 0 for maximum factuality and determinism
+    max_output_tokens=300,
+    temperature=0.0,
 )
 
-# Initialize Embedding Model & FAISS (in-memory)
-EMBEDDING_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
+# --- MEMORY OPTIMIZATION: Lazy Loading for Embedding Model ---
+# We define a placeholder for the model and a function to load it on first use.
+# This prevents loading the large model into memory when the app starts.
+EMBEDDING_MODEL = None
 EMBEDDING_DIM = 384
-FAISS_INDEX = faiss.IndexFlatL2(EMBEDDING_DIM) # Using L2 distance for similarity
+
+def get_embedding_model():
+    """
+    Lazily loads and caches the SentenceTransformer model to save memory on startup.
+    """
+    global EMBEDDING_MODEL
+    if EMBEDDING_MODEL is None:
+        print("🧠 Lazily loading embedding model (this will happen only once)...")
+        # You can choose a smaller model here if memory is still an issue
+        # e.g., 'paraphrase-MiniLM-L3-v2'
+        EMBEDDING_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
+        print("✅ Embedding model loaded into memory.")
+    return EMBEDDING_MODEL
+
+# FAISS Index and Document Store
+FAISS_INDEX = faiss.IndexFlatL2(EMBEDDING_DIM)
 DOCUMENT_STORE = []
 
 # FastAPI App
 app = FastAPI(
     title="High-Accuracy HackRx LLM Query Retrieval System",
-    description="A generalized RAG system focused on accuracy and comprehensive answers.",
-    version="3.0.0"
+    description="A generalized RAG system optimized for low-memory deployment.",
+    version="3.1.0"
 )
 security = HTTPBearer()
 
@@ -94,7 +111,7 @@ class ClauseMatch(BaseModel):
 
 class DocumentProcessor:
     def __init__(self):
-        self.chunk_size = 256  # Optimal size in tokens for the embedding model
+        self.chunk_size = 256
     
     def download_document(self, url: str) -> bytes:
         try:
@@ -108,28 +125,21 @@ class DocumentProcessor:
     def get_file_type(self, url: str) -> str:
         parsed_url = urlparse(url)
         file_path = parsed_url.path.lower()
-        if file_path.endswith('.pdf'):
-            return 'pdf'
-        elif file_path.endswith('.docx'):
-            return 'docx'
-        return 'pdf' # Default to PDF
+        if file_path.endswith('.pdf'): return 'pdf'
+        if file_path.endswith('.docx'): return 'docx'
+        return 'pdf'
     
     def extract_text(self, content: bytes, file_type: str) -> str:
-        if file_type == 'pdf':
-            return self._extract_text_from_pdf(content)
-        elif file_type == 'docx':
-            return self._extract_text_from_docx(content)
+        if file_type == 'pdf': return self._extract_text_from_pdf(content)
+        if file_type == 'docx': return self._extract_text_from_docx(content)
         raise ValueError(f"Unsupported file type: {file_type}")
 
     def _extract_text_from_pdf(self, content: bytes) -> str:
         try:
-            pdf_file = io.BytesIO(content)
-            reader = PyPDF2.PdfReader(pdf_file)
             text = ""
+            reader = PyPDF2.PdfReader(io.BytesIO(content))
             for page in reader.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
+                if page_text := page.extract_text(): text += page_text + "\n"
             print(f"📄 Extracted {len(text)} characters from PDF.")
             return text
         except Exception as e:
@@ -137,50 +147,27 @@ class DocumentProcessor:
     
     def _extract_text_from_docx(self, content: bytes) -> str:
         try:
-            doc_file = io.BytesIO(content)
-            doc = Document(doc_file)
-            text = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
+            doc = Document(io.BytesIO(content))
+            text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
             print(f"📄 Extracted {len(text)} characters from DOCX.")
             return text
         except Exception as e:
             raise Exception(f"Failed to extract text from DOCX: {str(e)}")
     
     def sentence_aware_chunking(self, text: str, metadata: Dict) -> List[DocumentChunk]:
-        """
-        Chunks text by grouping complete sentences, which is superior to fixed-size chunks.
-        This preserves the semantic meaning of the text.
-        """
-        # Split the text into sentences using regex
         sentences = re.split(r'(?<=[.!?])\s+', text.replace('\n', ' '))
         sentences = [s.strip() for s in sentences if s.strip()]
-
-        chunks = []
-        current_chunk_sentences = []
-        current_chunk_length = 0
-
+        chunks, current_chunk_sentences, current_chunk_length = [], [], 0
         for sentence in sentences:
             sentence_length = len(sentence.split())
             if current_chunk_length + sentence_length <= self.chunk_size:
                 current_chunk_sentences.append(sentence)
                 current_chunk_length += sentence_length
             else:
-                # Create a chunk from the current sentences
-                chunk_text = " ".join(current_chunk_sentences)
-                chunk_metadata = metadata.copy()
-                chunk_metadata["chunk_id"] = len(chunks)
-                chunks.append(DocumentChunk(content=chunk_text, metadata=chunk_metadata))
-                
-                # Start a new chunk with the current sentence
-                current_chunk_sentences = [sentence]
-                current_chunk_length = sentence_length
-        
-        # Add the last remaining chunk
+                chunks.append(DocumentChunk(content=" ".join(current_chunk_sentences), metadata={"chunk_id": len(chunks), **metadata}))
+                current_chunk_sentences, current_chunk_length = [sentence], sentence_length
         if current_chunk_sentences:
-            chunk_text = " ".join(current_chunk_sentences)
-            chunk_metadata = metadata.copy()
-            chunk_metadata["chunk_id"] = len(chunks)
-            chunks.append(DocumentChunk(content=chunk_text, metadata=chunk_metadata))
-
+            chunks.append(DocumentChunk(content=" ".join(current_chunk_sentences), metadata={"chunk_id": len(chunks), **metadata}))
         print(f"📊 Created {len(chunks)} sentence-aware chunks.")
         return chunks
 
@@ -190,45 +177,26 @@ class DocumentProcessor:
 
 class SemanticSearchService:
     def __init__(self):
-        self.embedding_model = EMBEDDING_MODEL
         self.faiss_index = FAISS_INDEX
         self.document_store = DOCUMENT_STORE
     
     def embed_and_index(self, chunks: List[DocumentChunk]) -> None:
-        """Embeds document chunks and indexes them in FAISS for fast retrieval."""
-        if not chunks:
-            print("⚠️ No chunks to embed.")
-            return
-        
-        self.faiss_index.reset()
-        self.document_store.clear()
-        
+        if not chunks: return
+        self.faiss_index.reset(); self.document_store.clear()
+        model = get_embedding_model() # Load model on demand
         texts = [chunk.content for chunk in chunks]
         print(f"🧠 Generating embeddings for {len(texts)} chunks...")
-        embeddings = self.embedding_model.encode(texts, normalize_embeddings=True, show_progress_bar=True)
-        
+        embeddings = model.encode(texts, normalize_embeddings=True)
         self.faiss_index.add(embeddings.astype('float32'))
-        self.document_store.extend([{"content": chunk.content, "metadata": chunk.metadata} for chunk in chunks])
-        
+        self.document_store.extend([{"content": c.content, "metadata": c.metadata} for c in chunks])
         print(f"✅ Embedded and indexed {self.faiss_index.ntotal} chunks.")
     
     async def search(self, query: str, top_k: int = 8) -> List[ClauseMatch]:
-        """Performs a pure semantic search to find the most relevant chunks."""
-        if self.faiss_index.ntotal == 0:
-            return []
-        
-        query_embedding = self.embedding_model.encode([query], normalize_embeddings=True)
+        if self.faiss_index.ntotal == 0: return []
+        model = get_embedding_model() # Load model on demand
+        query_embedding = model.encode([query], normalize_embeddings=True)
         distances, indices = self.faiss_index.search(query_embedding.astype('float32'), min(top_k, self.faiss_index.ntotal))
-        
-        results = []
-        for dist, idx in zip(distances[0], indices[0]):
-            if idx != -1:
-                doc = self.document_store[idx]
-                results.append(ClauseMatch(
-                    content=doc["content"],
-                    similarity_score=float(dist),
-                ))
-        return results
+        return [ClauseMatch(content=self.document_store[idx]["content"], similarity_score=float(dist)) for dist, idx in zip(distances[0], indices[0]) if idx != -1]
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #                               LLM SERVICE
@@ -240,79 +208,44 @@ class LLMService:
         self.generation_config = GENERATION_CONFIG
     
     def create_high_accuracy_prompt(self, query: str, relevant_chunks: List[ClauseMatch]) -> str:
-        """
-        Creates a highly-specific prompt designed to force the LLM to be factual,
-        comprehensive, and concise.
-        """
         context = "\n\n---\n\n".join([chunk.content for chunk in relevant_chunks])
-        
-        return f"""
-        **Role:** You are an expert document analyst. Your task is to answer a question with extreme precision based *only* on the provided text.
-
-        **Source Text:**
-        ---
-        {context}
-        ---
-
-        **Instructions:**
-        1.  Analyze the entire source text provided above.
-        2.  Identify all facts, figures, and conditions directly related to the user's question.
-        3.  Synthesize these facts into a single, comprehensive sentence.
-        4.  Your answer **MUST** be a single sentence.
-        5.  Do **NOT** add any information that is not explicitly stated in the source text.
-        6.  Do **NOT** start your answer with phrases like "According to the document..." or "The answer is...". Answer directly.
-        7.  Give the answer such that you are giving a examination answer and give single word answers in statement (like "average lifespan of humans is 65yrs" instead of just "65yrs").
-
-        **User Question:** {query}
-
-        **Single-Sentence Answer:**
-        """
+        return f"""**Role:** You are an expert document analyst. Your task is to answer a question with extreme precision based *only* on the provided text.
+**Source Text:**\n---\n{context}\n---\n
+**Instructions:**
+1. Analyze the entire source text.
+2. Synthesize all facts, figures, and conditions related to the user's question into a single, comprehensive sentence.
+3. Your answer **MUST** be a single sentence.
+4. Do **NOT** add any information not explicitly stated in the source text.
+5. Answer directly. Do not start with phrases like "According to the document...".
+**User Question:** {query}
+**Single-Sentence Answer:**"""
     
     async def generate_answer(self, query: str, relevant_chunks: List[ClauseMatch]) -> str:
-        """Generates a high-quality answer with an exponential backoff retry mechanism."""
-        if not relevant_chunks:
-            return "The provided document does not contain information relevant to this question."
-        
+        if not relevant_chunks: return "The provided document does not contain information relevant to this question."
         prompt = self.create_high_accuracy_prompt(query, relevant_chunks)
-        max_retries = 3
-        for attempt in range(max_retries):
+        for attempt in range(3):
             try:
-                response = await self.model.generate_content_async(
-                    prompt,
-                    generation_config=self.generation_config
-                )
-                answer = response.text.strip().replace('\n', ' ')
-                return ' '.join(answer.split())
+                response = await self.model.generate_content_async(prompt, generation_config=self.generation_config)
+                return ' '.join(response.text.strip().replace('\n', ' ').split())
             except Exception as e:
-                error_str = str(e)
-                if "429" in error_str and attempt < max_retries - 1:
+                if "429" in str(e) and attempt < 2:
                     wait_time = (2 ** attempt) + np.random.uniform(0, 1)
-                    print(f"Rate limit hit (429). Retrying in {wait_time:.2f}s...")
+                    print(f"Rate limit hit. Retrying in {wait_time:.2f}s...")
                     await asyncio.sleep(wait_time)
                 else:
-                    print(f"❌ LLM Error for '{query[:30]}...': {error_str}")
                     return f"An error occurred while generating the answer."
-        return "Failed to generate an answer after multiple retries due to API issues."
+        return "Failed to generate an answer after multiple retries."
     
     async def process_all_queries(self, queries: List[str], search_service: SemanticSearchService) -> List[str]:
-        """Processes a list of queries concurrently for maximum efficiency."""
         async def _process_one(query: str):
-            print(f"🔍 Searching for context for Q: '{query[:50]}...'")
-            # Retrieve more chunks to give the LLM a wider context
-            relevant_chunks = await search_service.search(query, top_k=8) 
-            if not relevant_chunks:
-                print(f"⚠️ No relevant chunks found for Q: '{query[:50]}...'")
+            relevant_chunks = await search_service.search(query, top_k=8)
             return await self.generate_answer(query, relevant_chunks)
-
-        tasks = [_process_one(q) for q in queries]
-        answers = await asyncio.gather(*tasks)
-        return answers
+        return await asyncio.gather(*[_process_one(q) for q in queries])
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #                                 API ROUTES
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Initialize services
 doc_processor = DocumentProcessor()
 search_service = SemanticSearchService()
 llm_service = LLMService()
@@ -323,41 +256,21 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
 
 @app.post("/hackrx/run", response_model=QueryResponse)
 async def run_submission(request: QueryRequest, _: str = Depends(verify_token)):
-    """Main endpoint to process a document and answer questions with high accuracy."""
     start_time = time.time()
     try:
-        print(f"🎯 Starting high-accuracy RAG process for {request.documents}")
-        
-        # Step 1: Download and Extract Text
+        print(f"🎯 Starting RAG process for {request.documents}")
         content = doc_processor.download_document(request.documents)
         file_type = doc_processor.get_file_type(request.documents)
         text = doc_processor.extract_text(content, file_type)
-        
-        # Step 2: Perform Sentence-Aware Chunking
-        metadata = {"source": request.documents}
-        chunks = doc_processor.sentence_aware_chunking(text, metadata)
-        
-        # Step 3: Embed and Index all chunks
-        search_service.embed_and_index(chunks)
-        
-        # Step 4: Concurrently process all questions
+        chunks = doc_processor.sentence_aware_chunking(text, {"source": request.documents})
+        search_service.embed_and_index(chunks) # This will trigger the one-time model load
         answers = await llm_service.process_all_queries(request.questions, search_service)
-        
-        print(f"✅ Process completed in {time.time() - start_time:.2f}s. Returning {len(answers)} answers.")
+        print(f"✅ Process completed in {time.time() - start_time:.2f}s.")
         return QueryResponse(answers=answers)
-        
     except Exception as e:
-        print(f"❌ A critical error occurred during the RAG process: {str(e)}")
-        # In a real-world scenario, you might want to log the full traceback here
+        print(f"❌ Critical error during RAG process: {str(e)}")
         raise HTTPException(status_code=500, detail=f"An internal processing error occurred: {str(e)}")
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint to verify service status."""
-    return {
-        "status": "healthy",
-        "version": "3.0.0",
-        "model": "gemini-1.5-flash",
-        "embedding_model": "all-MiniLM-L6-v2",
-        "faiss_indexed_items": FAISS_INDEX.ntotal
-    }
+    return {"status": "healthy", "version": "3.1.0", "model": "gemini-1.5-flash"}
