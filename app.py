@@ -68,9 +68,9 @@ def get_embedding_model():
     global EMBEDDING_MODEL
     if EMBEDDING_MODEL is None:
         print("🧠 Lazily loading embedding model (this will happen only once)...")
-        # You can choose a smaller model here if memory is still an issue
-        # e.g., 'paraphrase-MiniLM-L3-v2'
-        EMBEDDING_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
+        # UPDATED: Switched to a faster model to avoid request timeouts on free tiers.
+        # This model is excellent for question-answering tasks.
+        EMBEDDING_MODEL = SentenceTransformer('multi-qa-MiniLM-L6-cos-v1')
         print("✅ Embedding model loaded into memory.")
     return EMBEDDING_MODEL
 
@@ -82,7 +82,7 @@ DOCUMENT_STORE = []
 app = FastAPI(
     title="High-Accuracy HackRx LLM Query Retrieval System",
     description="A generalized RAG system optimized for low-memory deployment.",
-    version="3.1.0"
+    version="3.2.0" # Version bump for the model change
 )
 security = HTTPBearer()
 
@@ -273,4 +273,4 @@ async def run_submission(request: QueryRequest, _: str = Depends(verify_token)):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "version": "3.1.0", "model": "gemini-1.5-flash"}
+    return {"status": "healthy", "version": "3.2.0", "model": "gemini-1.5-flash"}
