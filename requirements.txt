@@ -4,6 +4,7 @@ python-dotenv
 requests
 PyPDF2
 python-docx
+gunicorn
 google-generativeai
 sentence-transformers
 faiss-cpu
